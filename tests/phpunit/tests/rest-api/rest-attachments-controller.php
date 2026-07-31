@@ -5138,10 +5138,61 @@ class WP_Test_REST_Attachments_Controller extends WP_Test_REST_Post_Type_Control
 	 * @return array A faked 200 response.
 	 */
 	public function mock_image_download( $response, $args, $url ) {
-		$this->last_download_url = $url;
+		$this->last_download_url  = $url;
+		$this->last_download_args = $args;
 
 		if ( ! empty( $args['filename'] ) ) {
 			copy( DIR_TESTDATA . '/images/canola.jpg', $args['filename'] );
+		}
+
+		return array(
+			'response' => array(
+				'code'    => 200,
+				'message' => 'OK',
+			),
+			'headers'  => array(),
+			'cookies'  => array(),
+			'body'     => '',
+		);
+	}
+
+	/**
+	 * The HTTP request arguments of the most recent mocked download.
+	 *
+	 * @var array|null
+	 */
+	protected $last_download_args = null;
+
+	/**
+	 * The path the most recent mocked download streamed to.
+	 *
+	 * @var string|null
+	 */
+	protected $last_download_file = null;
+
+	/**
+	 * Short-circuits download_url()'s HTTP request like mock_image_download(),
+	 * but truncates the streamed file at `limit_response_size` as the real
+	 * transports do.
+	 *
+	 * @param false|array|WP_Error $response A preempted response, or false to continue.
+	 * @param array                $args     HTTP request arguments.
+	 * @param string               $url      The request URL.
+	 * @return array A faked 200 response.
+	 */
+	public function mock_truncated_image_download( $response, $args, $url ) {
+		$this->last_download_url  = $url;
+		$this->last_download_args = $args;
+		$this->last_download_file = $args['filename'] ?? null;
+
+		if ( ! empty( $args['filename'] ) ) {
+			$body = (string) file_get_contents( DIR_TESTDATA . '/images/canola.jpg' );
+
+			if ( isset( $args['limit_response_size'] ) ) {
+				$body = substr( $body, 0, (int) $args['limit_response_size'] );
+			}
+
+			file_put_contents( $args['filename'], $body );
 		}
 
 		return array(
@@ -5392,6 +5443,324 @@ class WP_Test_REST_Attachments_Controller extends WP_Test_REST_Post_Type_Control
 		remove_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10 );
 
 		$this->assertErrorResponse( 'rest_upload_limited_space', $response, 400 );
+	}
+
+	/**
+	 * Caps wp_max_upload_size() at a known value for the duration of a test.
+	 *
+	 * Runs after the multisite upload_size_limit_filter() so the value is the
+	 * same in both suites.
+	 *
+	 * @param int $bytes Maximum upload size to report, in bytes.
+	 * @return Closure The filter callback, for removal by the caller.
+	 */
+	private function filter_max_upload_size( $bytes ) {
+		$filter = static function () use ( $bytes ) {
+			return $bytes;
+		};
+
+		add_filter( 'upload_size_limit', $filter, 20 );
+
+		return $filter;
+	}
+
+	/**
+	 * Verifies that the URL sideload path caps how much of the response is
+	 * written to disk.
+	 *
+	 * @ticket 65517
+	 *
+	 * @covers WP_REST_Attachments_Controller::create_item_from_url
+	 */
+	public function test_create_item_from_url_limits_the_response_size() {
+		$this->enable_client_side_media_processing();
+
+		wp_set_current_user( self::$superadmin_id );
+
+		$limit      = 200 * KB_IN_BYTES;
+		$size_limit = $this->filter_max_upload_size( $limit );
+
+		add_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10, 3 );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/media' );
+		$request->set_param( 'url', 'https://example.com/bounded.jpg' );
+		$request->set_param( 'generate_sub_sizes', false );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		remove_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10 );
+		remove_filter( 'upload_size_limit', $size_limit, 20 );
+
+		$this->assertSame( 201, $response->get_status(), 'A file below the limit should be accepted.' );
+		$this->assertArrayHasKey(
+			'limit_response_size',
+			(array) $this->last_download_args,
+			'The download should be bounded by a maximum response size.'
+		);
+		$this->assertSame(
+			$limit + 1,
+			$this->last_download_args['limit_response_size'],
+			'The response size should be capped one byte above the maximum upload size.'
+		);
+	}
+
+	/**
+	 * Verifies that a remote file larger than the maximum upload size is
+	 * rejected on the URL sideload path.
+	 *
+	 * @ticket 65517
+	 *
+	 * @covers WP_REST_Attachments_Controller::create_item_from_url
+	 */
+	public function test_create_item_from_url_rejects_file_over_max_upload_size() {
+		$this->enable_client_side_media_processing();
+
+		wp_set_current_user( self::$superadmin_id );
+
+		$attachments_before = $this->count_attachments();
+
+		// One byte below the fixture's size, so only this check can reject it.
+		$size_limit = $this->filter_max_upload_size( filesize( DIR_TESTDATA . '/images/canola.jpg' ) - 1 );
+
+		add_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10, 3 );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/media' );
+		$request->set_param( 'url', 'https://example.com/too-large.jpg' );
+		$request->set_param( 'generate_sub_sizes', false );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		remove_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10 );
+		remove_filter( 'upload_size_limit', $size_limit, 20 );
+
+		$this->assertErrorResponse( 'rest_upload_file_too_big', $response, 400 );
+		$this->assertSame(
+			$attachments_before,
+			$this->count_attachments(),
+			'No attachment should be created for an oversized remote file.'
+		);
+	}
+
+	/**
+	 * Verifies that a remote file exactly at the maximum upload size is still
+	 * accepted, so the limit is not off by one.
+	 *
+	 * @ticket 65517
+	 *
+	 * @covers WP_REST_Attachments_Controller::create_item_from_url
+	 */
+	public function test_create_item_from_url_accepts_file_at_max_upload_size() {
+		$this->enable_client_side_media_processing();
+
+		wp_set_current_user( self::$superadmin_id );
+
+		$size_limit = $this->filter_max_upload_size( filesize( DIR_TESTDATA . '/images/canola.jpg' ) );
+
+		add_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10, 3 );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/media' );
+		$request->set_param( 'url', 'https://example.com/exact.jpg' );
+		$request->set_param( 'generate_sub_sizes', false );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		remove_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10 );
+		remove_filter( 'upload_size_limit', $size_limit, 20 );
+
+		$this->assertSame( 201, $response->get_status() );
+	}
+
+	/**
+	 * Verifies that a download truncated at the cap is rejected rather than
+	 * stored as a partial image, and that the temporary file is removed.
+	 *
+	 * @ticket 65517
+	 *
+	 * @covers WP_REST_Attachments_Controller::create_item_from_url
+	 */
+	public function test_create_item_from_url_rejects_truncated_download() {
+		$this->enable_client_side_media_processing();
+
+		wp_set_current_user( self::$superadmin_id );
+
+		$attachments_before = $this->count_attachments();
+
+		$size_limit = $this->filter_max_upload_size( KB_IN_BYTES );
+
+		add_filter( 'pre_http_request', array( $this, 'mock_truncated_image_download' ), 10, 3 );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/media' );
+		$request->set_param( 'url', 'https://example.com/truncated.jpg' );
+		$request->set_param( 'generate_sub_sizes', false );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		remove_filter( 'pre_http_request', array( $this, 'mock_truncated_image_download' ), 10 );
+		remove_filter( 'upload_size_limit', $size_limit, 20 );
+
+		$this->assertErrorResponse( 'rest_upload_file_too_big', $response, 400 );
+		$this->assertSame(
+			$attachments_before,
+			$this->count_attachments(),
+			'No attachment should be created from a truncated download.'
+		);
+		$this->assertNotNull( $this->last_download_file, 'The download should have streamed to a temporary file.' );
+		$this->assertFileDoesNotExist(
+			$this->last_download_file,
+			'The temporary file should be removed when the size check fails.'
+		);
+	}
+
+	/**
+	 * Verifies that a PHP configuration without an upload limit is not bounded.
+	 *
+	 * @ticket 65517
+	 * @group ms-excluded
+	 *
+	 * @covers WP_REST_Attachments_Controller::create_item_from_url
+	 */
+	public function test_create_item_from_url_does_not_bound_an_unlimited_php_config() {
+		$this->enable_client_side_media_processing();
+
+		wp_set_current_user( self::$superadmin_id );
+
+		$size_limit = $this->filter_max_upload_size( 0 );
+
+		add_filter( 'pre_http_request', array( $this, 'mock_truncated_image_download' ), 10, 3 );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/media' );
+		$request->set_param( 'url', 'https://example.com/no-limit.jpg' );
+		$request->set_param( 'generate_sub_sizes', false );
+
+		$response = rest_get_server()->dispatch( $request );
+
+		remove_filter( 'pre_http_request', array( $this, 'mock_truncated_image_download' ), 10 );
+		remove_filter( 'upload_size_limit', $size_limit, 20 );
+
+		$this->assertNotNull( $this->last_download_args, 'The download should have been attempted.' );
+		$this->assertNull(
+			$this->last_download_args['limit_response_size'],
+			'An unlimited PHP configuration should not be bounded, which would reject every sideload.'
+		);
+		$this->assertSame( 201, $response->get_status(), 'The sideload should succeed when no limit is configured.' );
+	}
+
+	/**
+	 * Verifies that the bound applies only to the streamed download.
+	 *
+	 * @ticket 65517
+	 *
+	 * @covers WP_REST_Attachments_Controller::create_item_from_url
+	 */
+	public function test_create_item_from_url_only_bounds_the_streamed_request() {
+		$this->enable_client_side_media_processing();
+
+		wp_set_current_user( self::$superadmin_id );
+
+		$size_limit         = $this->filter_max_upload_size( 200 * KB_IN_BYTES );
+		$non_streamed_args  = null;
+		$capture_non_stream = static function ( $response, $args, $url ) use ( &$non_streamed_args ) {
+			if ( empty( $args['stream'] ) ) {
+				$non_streamed_args = $args;
+
+				return array(
+					'response' => array(
+						'code'    => 200,
+						'message' => 'OK',
+					),
+					'headers'  => array(),
+					'cookies'  => array(),
+					'body'     => '',
+				);
+			}
+
+			return $response;
+		};
+
+		// Issue an unrelated, non-streamed request while the filter is in place.
+		$piggyback = static function ( $args ) use ( &$piggyback ) {
+			if ( ! empty( $args['stream'] ) ) {
+				remove_filter( 'http_request_args', $piggyback, 5 );
+				wp_remote_get( 'https://example.com/unrelated.json' );
+			}
+
+			return $args;
+		};
+
+		add_filter( 'pre_http_request', $capture_non_stream, 5, 3 );
+		add_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10, 3 );
+		add_filter( 'http_request_args', $piggyback, 5 );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/media' );
+		$request->set_param( 'url', 'https://example.com/canola.jpg' );
+		$request->set_param( 'generate_sub_sizes', false );
+
+		rest_get_server()->dispatch( $request );
+
+		remove_filter( 'http_request_args', $piggyback, 5 );
+		remove_filter( 'pre_http_request', array( $this, 'mock_image_download' ), 10 );
+		remove_filter( 'pre_http_request', $capture_non_stream, 5 );
+		remove_filter( 'upload_size_limit', $size_limit, 20 );
+
+		$this->assertNotNull( $non_streamed_args, 'The non-streamed request should have been made.' );
+		$this->assertNull(
+			$non_streamed_args['limit_response_size'],
+			'A non-streamed request should not inherit the download bound.'
+		);
+	}
+
+	/**
+	 * Verifies that the request-argument filter does not outlive the download.
+	 *
+	 * @ticket 65517
+	 *
+	 * @covers WP_REST_Attachments_Controller::create_item_from_url
+	 */
+	public function test_create_item_from_url_removes_the_size_filter_after_downloading() {
+		$this->enable_client_side_media_processing();
+
+		wp_set_current_user( self::$superadmin_id );
+
+		$size_limit = $this->filter_max_upload_size( 200 * KB_IN_BYTES );
+		$before     = has_filter( 'http_request_args' );
+
+		$fail_download = static function () {
+			return new WP_Error( 'http_request_failed', 'Could not resolve host.' );
+		};
+		add_filter( 'pre_http_request', $fail_download );
+
+		$request = new WP_REST_Request( 'POST', '/wp/v2/media' );
+		$request->set_param( 'url', 'https://example.com/fails.jpg' );
+		$request->set_param( 'generate_sub_sizes', false );
+
+		rest_get_server()->dispatch( $request );
+
+		remove_filter( 'pre_http_request', $fail_download );
+		remove_filter( 'upload_size_limit', $size_limit, 20 );
+
+		$this->assertSame(
+			$before,
+			has_filter( 'http_request_args' ),
+			'The size filter should be removed even when the download fails.'
+		);
+	}
+
+	/**
+	 * Counts the attachments in the media library.
+	 *
+	 * @return int Number of attachments.
+	 */
+	private function count_attachments() {
+		return count(
+			get_posts(
+				array(
+					'post_type'      => 'attachment',
+					'post_status'    => 'inherit',
+					'posts_per_page' => -1,
+					'fields'         => 'ids',
+				)
+			)
+		);
 	}
 
 	/**

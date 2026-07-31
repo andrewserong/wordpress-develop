@@ -626,12 +626,37 @@ class WP_REST_Attachments_Controller extends WP_REST_Posts_Controller {
 			);
 		}
 
+		// Limit how much of the response is written to disk. Zero means no limit is configured.
+		$max_size    = (int) wp_max_upload_size();
+		$size_filter = null;
+
+		if ( $max_size > 0 ) {
+			// One byte over the limit, so that an oversized file can be detected below.
+			$size_filter = static function ( $args ) use ( $max_size ) {
+				// download_url() may also make a non-streamed request, which sets its own limit.
+				if ( ! empty( $args['stream'] ) ) {
+					$args['limit_response_size'] = $max_size + 1;
+				}
+
+				return $args;
+			};
+
+			add_filter( 'http_request_args', $size_filter, PHP_INT_MAX );
+		}
+
 		/*
 		 * Download the remote file with WordPress's HTTP API, which validates
 		 * the host and blocks requests to private or local addresses. This is
 		 * the same primitive core's media_sideload_image() relies on.
 		 */
-		$tmp_file = download_url( $url );
+		try {
+			$tmp_file = download_url( $url );
+		} finally {
+			if ( $size_filter ) {
+				remove_filter( 'http_request_args', $size_filter, PHP_INT_MAX );
+			}
+		}
+
 		if ( is_wp_error( $tmp_file ) ) {
 			return $tmp_file;
 		}
@@ -642,6 +667,17 @@ class WP_REST_Attachments_Controller extends WP_REST_Posts_Controller {
 		);
 
 		$size_check = self::check_upload_size( $file_array );
+
+		// An oversized response is truncated rather than failed, so check the size on disk.
+		if ( ! is_wp_error( $size_check ) && $max_size > 0 && filesize( $tmp_file ) > $max_size ) {
+			$size_check = new WP_Error(
+				'rest_upload_file_too_big',
+				/* translators: %s: Maximum allowed file size in kilobytes. */
+				sprintf( __( 'This file is too big. Files must be less than %s KB in size.' ), number_format( $max_size / KB_IN_BYTES ) ),
+				array( 'status' => 400 )
+			);
+		}
+
 		if ( is_wp_error( $size_check ) ) {
 			if ( file_exists( $tmp_file ) ) {
 				wp_delete_file( $tmp_file );
